@@ -29,9 +29,15 @@ import type {
   ReportDailyComparisonPointDto,
   ReportOverviewDto,
   ReportPaginationDto,
+  ReportSortDto,
 } from "@wpptrack/shared";
 import { PrismaService } from "../common/prisma/prisma.service";
 import { isSupportedConversionEventName } from "../conversion-events/conversion-event-registry";
+import {
+  BLOCKED_CONVERSION_RETRY_LIMIT,
+  canRetryConversionEvent,
+  configurationBlockedConversionEventWhere,
+} from "../conversion-events/conversion-event-retry";
 import { buildMetaCapiPayload } from "../conversion-events/meta-capi-payload.builder";
 import { FunnelConfigurationService } from "../conversion-rules/funnel-configuration.service";
 import { InboundWebhookChannelRoutesService } from "../inbound-webhooks/inbound-webhook-channel-routes.service";
@@ -50,7 +56,9 @@ import {
   type MetaCampaignAsset,
   type MetaCampaignDailyInsight,
   type MetaCampaignInsight,
+  type MetaPreviewEnrichmentStats,
 } from "../integrations/meta/meta.adapter";
+import { evaluateMetaPreviewUrlFreshness } from "../integrations/meta/meta-preview-url-freshness";
 import { MetaAdDestinationRoutingService } from "../integrations/meta/meta-ad-destination-routing.service";
 import { MetaTokenEncryptionService } from "../integrations/meta/meta-token-encryption.service";
 import { MetaConnectionResolverService } from "../integrations/meta/meta-connection-resolver.service";
@@ -59,11 +67,21 @@ import {
   type WhatsappClassification,
 } from "./whatsapp-campaign-classifier.service";
 import {
+  chunked,
+  leadFirstContactBeforeWhere,
+  leadFirstContactInRangeWhere,
+  loadLeadIdsByPhoneHash,
+  paidLeadSubmittedEventWhere,
+  phoneHashesWithoutLeadId,
+  withFirstContactAttribution,
+} from "../leads/lead-cohort";
+import {
   ReportingMetricsEngine,
   type ReportingMetricEvent,
   type ReportingMetricLead,
   type ReportingMetricScope,
 } from "./reporting-metrics.engine";
+import { sortReportRows, type SortableReportRow } from "./report-row-sort";
 
 export type MetaStructureSyncInput = {
   workspaceId: string;
@@ -107,6 +125,7 @@ type ReportFilterInput = {
   whatsappClassification?: WhatsappClassificationFilter;
   page?: number;
   pageSize?: number;
+  sort?: ReportSortDto;
 };
 
 type ReportMetricScopeFilter = {
@@ -158,6 +177,40 @@ type MetaReportingAccountRecord = {
   adAccountId: string;
   adAccountName: string;
   active: boolean;
+};
+
+/**
+ * Media previously saved for one workspace + reporting account, keyed by
+ * creative id so it is only ever applied to the same creative.
+ */
+type SavedAdMedia = {
+  /**
+   * Any saved preview of the creative, reused without asking Graph again.
+   * The fbcdn `oe` expiry hint is only used to prefer the freshest of several
+   * saved URLs, never to force a refetch (Graph calls count against the
+   * shared app-level rate limit).
+   */
+  reusablePreviewUrls: Map<string, string>;
+  /** Any saved preview, used only when enrichment of that creative failed. */
+  previewByCreative: Map<string, string>;
+  thumbnailByCreative: Map<string, string>;
+  /**
+   * Creatives that recently came back from Graph without a usable preview
+   * (absent or failed). They are not requested again until the TTL expires.
+   */
+  skipPreviewCreativeIds: Set<string>;
+};
+
+/**
+ * How long a creative that came back absent/failed is not requested again.
+ * Kept in memory only (no schema change): a restart forgets it, which costs
+ * at most one extra request per such creative.
+ */
+export const META_PREVIEW_MISS_TTL_MS = 24 * 60 * 60 * 1000;
+
+type AdMediaResolutionCounters = {
+  preservedAfterFailure: number;
+  thumbnailsPreserved: number;
 };
 
 type ExistingClassificationRecord = {
@@ -236,6 +289,15 @@ type MetaAdRecord = {
 };
 
 type ConversionEventRecord = ReportingMetricEvent;
+
+type ConversionAuditFilters = {
+  workspaceId: string;
+  since?: string;
+  until?: string;
+  eventName?: string;
+  deliveryState?: ConversionAuditDeliveryStateDto;
+  source?: ConversionAuditSourceDto;
+};
 
 type ConversionAuditEventRecord = {
   id: string;
@@ -345,6 +407,8 @@ type WhatsappOverrideUpdateData = {
 @Injectable()
 export class MetaReportingService {
   private readonly logger = new Logger(MetaReportingService.name);
+  /** `${workspaceId}|${businessId}|${adAccountId}|${creativeId}` -> expiry ms */
+  private readonly previewMissUntil = new Map<string, number>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -547,7 +611,7 @@ export class MetaReportingService {
     const [
       campaigns,
       adSets,
-      ads,
+      adListing,
       campaignInsights,
       campaignDailyInsightsBatch,
       adSetInsights,
@@ -563,7 +627,11 @@ export class MetaReportingService {
         accessToken: input.accessToken,
         adAccountId,
       }),
-      this.metaAdapter.listAds({ accessToken: input.accessToken, adAccountId }),
+      this.listAdsReusingSavedMedia({
+        workspaceId: input.workspaceId,
+        accessToken: input.accessToken,
+        account: input.account,
+      }),
       this.metaAdapter.listCampaignInsights({
         accessToken: input.accessToken,
         adAccountId,
@@ -640,6 +708,25 @@ export class MetaReportingService {
             dailyInsights: adDailyInsightsBatch,
           })
         : adDailyInsightsBatch;
+    const { ads, previewStats, savedMedia } = adListing;
+    const mediaCounters: AdMediaResolutionCounters = {
+      preservedAfterFailure: 0,
+      thumbnailsPreserved: 0,
+    };
+    const mediaByAdId = new Map(
+      ads.map((ad) => [
+        ad.id,
+        this.resolveAdMedia(ad, savedMedia, mediaCounters),
+      ]),
+    );
+    this.logPreviewEnrichment({
+      workspaceId: input.workspaceId,
+      reportingAccountId: input.account.id,
+      adCount: ads.length,
+      stats: previewStats,
+      savedMedia,
+      counters: mediaCounters,
+    });
     const insightByCampaign = new Map(
       campaignInsights.map((item) => [item.campaignId, item]),
     );
@@ -804,6 +891,10 @@ export class MetaReportingService {
           workspaceId: input.workspaceId,
           account: input.account,
           ad,
+          media: mediaByAdId.get(ad.id) ?? {
+            previewUrl: null,
+            thumbnailUrl: null,
+          },
           destinationType: adSetById.get(ad.adSetId)?.destinationType ?? null,
           insight: insightByAd.get(ad.id),
           classification:
@@ -865,6 +956,233 @@ export class MetaReportingService {
       adSetsSynced: adSets.length,
       adsSynced: ads.length,
     };
+  }
+
+  private async listAdsReusingSavedMedia(input: {
+    workspaceId: string;
+    accessToken: string;
+    account: MetaReportingAccountRecord;
+  }): Promise<{
+    ads: MetaAdAsset[];
+    previewStats: MetaPreviewEnrichmentStats;
+    savedMedia: SavedAdMedia;
+  }> {
+    const savedMedia = await this.loadSavedAdMedia(input);
+    const { ads, previewStats } =
+      await this.metaAdapter.listAdsWithPreviewStats({
+        accessToken: input.accessToken,
+        adAccountId: input.account.adAccountId,
+        reusablePreviewUrls: savedMedia.reusablePreviewUrls,
+        skipPreviewCreativeIds: savedMedia.skipPreviewCreativeIds,
+      });
+    this.rememberPreviewMisses(input, ads, savedMedia);
+
+    return { ads, previewStats, savedMedia };
+  }
+
+  private previewMissKey(
+    input: { workspaceId: string; account: MetaReportingAccountRecord },
+    creativeId: string,
+  ): string {
+    return [
+      input.workspaceId,
+      input.account.businessId ?? "",
+      input.account.adAccountId,
+      creativeId,
+    ].join("|");
+  }
+
+  /**
+   * Remembers creatives Graph just returned without a usable preview so the
+   * next syncs do not request them again within META_PREVIEW_MISS_TTL_MS.
+   */
+  private rememberPreviewMisses(
+    input: { workspaceId: string; account: MetaReportingAccountRecord },
+    ads: MetaAdAsset[],
+    savedMedia: SavedAdMedia,
+  ): void {
+    const until = Date.now() + META_PREVIEW_MISS_TTL_MS;
+
+    for (const ad of ads) {
+      if (
+        ad.creativeId &&
+        (ad.previewSource === "absent" || ad.previewSource === "failed") &&
+        !ad.previewUrl &&
+        !savedMedia.previewByCreative.has(ad.creativeId)
+      ) {
+        this.previewMissUntil.set(
+          this.previewMissKey(input, ad.creativeId),
+          until,
+        );
+      }
+    }
+  }
+
+  private async loadSavedAdMedia(input: {
+    workspaceId: string;
+    account: MetaReportingAccountRecord;
+  }): Promise<SavedAdMedia> {
+    // Scoped to this tenant and this exact ad account: media saved by another
+    // workspace or account is never reused, even for the same creative id.
+    const rows = (await this.prisma.metaAd.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        businessId: input.account.businessId,
+        adAccountId: input.account.adAccountId,
+        creativeId: { not: null },
+      },
+      select: { creativeId: true, previewUrl: true, thumbnailUrl: true },
+    })) as Array<{
+      creativeId: string | null;
+      previewUrl: string | null;
+      thumbnailUrl: string | null;
+    }>;
+    const now = new Date();
+    const savedMedia: SavedAdMedia = {
+      reusablePreviewUrls: new Map(),
+      previewByCreative: new Map(),
+      thumbnailByCreative: new Map(),
+      skipPreviewCreativeIds: new Set(),
+    };
+    const reusableExpiryByCreative = new Map<string, number>();
+    const nowMs = now.getTime();
+
+    for (const [key, until] of this.previewMissUntil) {
+      if (until <= nowMs) {
+        this.previewMissUntil.delete(key);
+      }
+    }
+
+    for (const row of rows) {
+      const creativeId = row.creativeId;
+
+      if (!creativeId) {
+        continue;
+      }
+
+      if (row.thumbnailUrl && !savedMedia.thumbnailByCreative.has(creativeId)) {
+        savedMedia.thumbnailByCreative.set(creativeId, row.thumbnailUrl);
+      }
+
+      if (!row.previewUrl) {
+        if (this.previewMissUntil.has(this.previewMissKey(input, creativeId))) {
+          savedMedia.skipPreviewCreativeIds.add(creativeId);
+        }
+
+        continue;
+      }
+
+      if (!savedMedia.previewByCreative.has(creativeId)) {
+        savedMedia.previewByCreative.set(creativeId, row.previewUrl);
+        savedMedia.reusablePreviewUrls.set(creativeId, row.previewUrl);
+      }
+
+      // Expired/unknown hints still reuse the saved URL; the hint only picks
+      // the freshest one when the same creative has several saved URLs.
+      const freshness = evaluateMetaPreviewUrlFreshness(row.previewUrl, now);
+
+      if (
+        freshness.reusable &&
+        freshness.expiresAt.getTime() >
+          (reusableExpiryByCreative.get(creativeId) ?? 0)
+      ) {
+        reusableExpiryByCreative.set(creativeId, freshness.expiresAt.getTime());
+        savedMedia.reusablePreviewUrls.set(creativeId, row.previewUrl);
+        savedMedia.previewByCreative.set(creativeId, row.previewUrl);
+      }
+    }
+
+    for (const creativeId of savedMedia.reusablePreviewUrls.keys()) {
+      savedMedia.skipPreviewCreativeIds.delete(creativeId);
+    }
+
+    return savedMedia;
+  }
+
+  /**
+   * Picks the media to persist for one ad. Prior media is only carried over
+   * for the same creative id: a failed lookup keeps that creative's saved
+   * preview, a thumbnail missing from the ads list keeps that creative's saved
+   * thumbnail. A changed or removed creative never inherits old media, and a
+   * creative Graph returned without media ("absent") is stored as null.
+   */
+  private resolveAdMedia(
+    ad: MetaAdAsset,
+    savedMedia: SavedAdMedia,
+    counters: AdMediaResolutionCounters,
+  ): { previewUrl: string | null; thumbnailUrl: string | null } {
+    let previewUrl = ad.previewUrl ?? null;
+    let thumbnailUrl = ad.thumbnailUrl ?? null;
+
+    if (!ad.creativeId) {
+      return { previewUrl: null, thumbnailUrl };
+    }
+
+    if (ad.previewSource === "failed") {
+      const priorPreview = savedMedia.previewByCreative.get(ad.creativeId);
+
+      if (priorPreview) {
+        previewUrl = priorPreview;
+        counters.preservedAfterFailure += 1;
+      }
+    }
+
+    if (!thumbnailUrl) {
+      const priorThumbnail = savedMedia.thumbnailByCreative.get(ad.creativeId);
+
+      if (priorThumbnail) {
+        thumbnailUrl = priorThumbnail;
+        counters.thumbnailsPreserved += 1;
+      }
+    }
+
+    return { previewUrl, thumbnailUrl };
+  }
+
+  private logPreviewEnrichment(input: {
+    workspaceId: string;
+    reportingAccountId: string;
+    adCount: number;
+    stats: MetaPreviewEnrichmentStats;
+    savedMedia: SavedAdMedia;
+    counters: AdMediaResolutionCounters;
+  }): void {
+    const { stats } = input;
+    const savedNotReusable =
+      input.savedMedia.previewByCreative.size -
+      input.savedMedia.reusablePreviewUrls.size;
+
+    // Aggregate counters only: no URLs, tokens or Graph error text.
+    this.logger.log(
+      [
+        "Meta preview enrichment",
+        `workspaceId=${input.workspaceId}`,
+        `reportingAccountId=${input.reportingAccountId}`,
+        `ads=${input.adCount}`,
+        `distinctCreatives=${stats.distinctCreatives}`,
+        `reused=${stats.creativesReused}`,
+        `skipped=${stats.creativesSkipped}`,
+        `requested=${stats.creativesRequested}`,
+        `succeeded=${stats.creativesSucceeded}`,
+        `failed=${stats.creativesFailed}`,
+        `absent=${stats.creativesWithoutPreview}`,
+        `creativeBatches=${stats.creativeBatchRequests}`,
+        `videosRequested=${stats.videosRequested}`,
+        `videosSucceeded=${stats.videosSucceeded}`,
+        `videosFailed=${stats.videosFailed}`,
+        `videoBatches=${stats.videoBatchRequests}`,
+        `rateLimited=${stats.failureReasons.rateLimited}`,
+        `serverError=${stats.failureReasons.serverError}`,
+        `clientError=${stats.failureReasons.clientError}`,
+        `missingItem=${stats.failureReasons.missingItem}`,
+        `notAttempted=${stats.failureReasons.notAttempted}`,
+        `transportError=${stats.failureReasons.transportError}`,
+        `unexpected=${stats.failureReasons.unexpected}`,
+        `savedNotReusable=${savedNotReusable}`,
+        `preservedAfterFailure=${input.counters.preservedAfterFailure}`,
+        `thumbnailsPreserved=${input.counters.thumbnailsPreserved}`,
+      ].join(" "),
+    );
   }
 
   private async resolveManualCampaignDailyInsights(input: {
@@ -1570,7 +1888,6 @@ export class MetaReportingService {
       whatsappAds,
       deliveredIds,
     );
-    const paginated = this.paginateRecords(filteredCampaigns, input);
     const campaignIds = filteredCampaigns.map(
       (campaign) => campaign.campaignId,
     );
@@ -1582,6 +1899,8 @@ export class MetaReportingService {
       workspaceConversionLogs,
       workspaceLeads,
       dailyInsights,
+      returningEvents,
+      workspaceReturningEvents,
     ] = await Promise.all([
       this.getMetricConversionEvents(input, { campaignIds }),
       this.getLeads(input, { campaignIds }),
@@ -1606,12 +1925,35 @@ export class MetaReportingService {
             },
           }) as Promise<MetaCampaignDailyInsightRecord[]>)
         : Promise.resolve([] as MetaCampaignDailyInsightRecord[]),
+      this.getReturningLeadEvents(input, { campaignIds }),
+      needsWorkspaceMetrics
+        ? this.getReturningLeadEvents(input, summaryScope)
+        : Promise.resolve([]),
     ]);
+    // "Conversaram mais de uma vez": conversations without a lead id count
+    // for every lead of their phone, resolved from the database like the
+    // Leads page does (shared helper).
+    const leadIdsByPhoneHash = await loadLeadIdsByPhoneHash(
+      this.prisma,
+      input.workspaceId,
+      phoneHashesWithoutLeadId(
+        [...conversionLogs, ...workspaceConversionLogs].filter(
+          (event) =>
+            event.eventName === "LeadSubmitted" &&
+            event.status !== "skipped" &&
+            event.businessSource?.trim().toLowerCase() !== "organic",
+        ),
+      ),
+    );
     const conversionLogsByCampaign = this.groupByOptionalKey(
       conversionLogs,
       "campaignId",
     );
     const leadsByCampaign = this.groupByOptionalKey(leads, "campaignId");
+    const returningEventsByCampaign = this.groupByOptionalKey(
+      returningEvents,
+      "campaignId",
+    );
     const childMetricByCampaign = this.campaignMetricOverrides(
       usesWhatsappDefault ? whatsappAdSets : [],
       usesWhatsappDefault ? whatsappAds : [],
@@ -1641,15 +1983,21 @@ export class MetaReportingService {
     const metricByCampaign = dailyComparisonAvailable
       ? dailyMetricByCampaign
       : childMetricByCampaign;
-    const rows = paginated.items.map((campaign) =>
-      this.toReportRow(
-        campaign,
-        conversionLogsByCampaign.get(campaign.campaignId) ?? [],
-        leadsByCampaign.get(campaign.campaignId) ?? [],
-        funnelStages,
-        metricByCampaign.get(campaign.campaignId),
-      ),
+    const paginated = this.paginateReportRows(
+      filteredCampaigns,
+      input,
+      (campaign) =>
+        this.toReportRow(
+          campaign,
+          conversionLogsByCampaign.get(campaign.campaignId) ?? [],
+          leadsByCampaign.get(campaign.campaignId) ?? [],
+          funnelStages,
+          metricByCampaign.get(campaign.campaignId),
+          returningEventsByCampaign.get(campaign.campaignId) ?? [],
+          leadIdsByPhoneHash,
+        ),
     );
+    const rows = paginated.items;
     const workspaceMeta = filteredCampaigns.reduce(
       (totals, campaign) => {
         const metricOverride = metricByCampaign.get(campaign.campaignId);
@@ -1669,6 +2017,8 @@ export class MetaReportingService {
       metaConversationsStarted: workspaceMeta.metaConversationsStarted,
       events: conversionLogs,
       leads,
+      returningEvents,
+      leadIdsByPhoneHash,
       scope: {},
     });
     const summary: CampaignReportRowDto | undefined = input.includeSummary
@@ -1686,6 +2036,8 @@ export class MetaReportingService {
             metaConversationsStarted: workspaceMeta.metaConversationsStarted,
             events: workspaceConversionLogs,
             leads: workspaceLeads,
+            returningEvents: workspaceReturningEvents,
+            leadIdsByPhoneHash,
             scope: {},
           }),
         }
@@ -1694,8 +2046,8 @@ export class MetaReportingService {
       input.includeDaily && input.since && input.until
         ? this.dailyComparison({
             dailyInsights,
-            events: workspaceConversionLogs,
             leads: workspaceLeads,
+            returningEvents: workspaceReturningEvents,
             since: input.since,
             until: input.until,
           })
@@ -1731,23 +2083,7 @@ export class MetaReportingService {
     page: number;
     pageSize: number;
   }): Promise<ConversionAuditOverviewDto> {
-    const where: Prisma.ConversionEventLogWhereInput = {
-      workspaceId: input.workspaceId,
-      ...this.conversionAuditPeriodWhere(input),
-      ...(input.eventName ? { eventName: input.eventName } : {}),
-      ...(input.deliveryState
-        ? { status: { in: this.conversionAuditStatuses(input.deliveryState) } }
-        : {}),
-      AND: [
-        this.conversionAuditSourceWhere(input.source),
-        {
-          NOT: {
-            sourceTrigger: "auto_lead",
-            ctwaClid: null,
-          },
-        },
-      ],
-    };
+    const where = this.conversionAuditWhere(input);
     const [events, statusGroups, funnelStages] = await Promise.all([
       this.prisma.conversionEventLog.findMany({
         where,
@@ -1823,6 +2159,24 @@ export class MetaReportingService {
         this.conversionAuditEventDto(event, eventLabels, context),
       ),
     };
+  }
+
+  async getBlockedConversionEventRetryIds(
+    input: ConversionAuditFilters,
+  ): Promise<string[]> {
+    const events = await this.prisma.conversionEventLog.findMany({
+      where: {
+        AND: [
+          this.conversionAuditWhere(input),
+          configurationBlockedConversionEventWhere,
+        ],
+      },
+      orderBy: [{ eventOccurredAt: "desc" }, { id: "desc" }],
+      take: BLOCKED_CONVERSION_RETRY_LIMIT,
+      select: { id: true },
+    });
+
+    return events.map((event) => event.id);
   }
 
   async getConversionEventAuditDetail(input: {
@@ -2438,7 +2792,8 @@ export class MetaReportingService {
         "Status",
         "Investimento",
         "Conversas Meta",
-        "Conversas reais",
+        "Leads novos",
+        "Leads que voltaram",
         "Leads organicos",
         "Total recebido",
         "Taxa de rastreio",
@@ -2456,6 +2811,7 @@ export class MetaReportingService {
         this.centsToDecimal(campaign.spendCents),
         String(campaign.metaConversationsStarted),
         String(campaign.realConversations),
+        String(campaign.returningLeads ?? 0),
         String(campaign.organicLeads),
         String(campaign.totalReceived),
         campaign.trackingRate === null ? "" : String(campaign.trackingRate),
@@ -2530,32 +2886,37 @@ export class MetaReportingService {
       adsForNameFilter,
       deliveredIds,
     );
-    const paginated = this.paginateRecords(filteredAdSets, input);
     const adSetIds = filteredAdSets.map((adSet) => adSet.adSetId);
-    const [conversionLogs, leads, dailyInsights] = await Promise.all([
-      this.getMetricConversionEvents(input, { adSetIds }),
-      this.getLeads(input, { adSetIds }),
-      input.since && input.until && adSetIds.length
-        ? (this.prisma.metaAdSetDailyInsight.findMany({
-            where: {
-              workspaceId: input.workspaceId,
-              adSetId: { in: adSetIds },
-              localDate: { gte: input.since, lte: input.until },
-            },
-            select: {
-              adSetId: true,
-              localDate: true,
-              spendCents: true,
-              metaConversationsStarted: true,
-            },
-          }) as Promise<MetaAdSetDailyInsightRecord[]>)
-        : Promise.resolve([] as MetaAdSetDailyInsightRecord[]),
-    ]);
+    const [conversionLogs, leads, dailyInsights, returningEvents] =
+      await Promise.all([
+        this.getMetricConversionEvents(input, { adSetIds }),
+        this.getLeads(input, { adSetIds }),
+        input.since && input.until && adSetIds.length
+          ? (this.prisma.metaAdSetDailyInsight.findMany({
+              where: {
+                workspaceId: input.workspaceId,
+                adSetId: { in: adSetIds },
+                localDate: { gte: input.since, lte: input.until },
+              },
+              select: {
+                adSetId: true,
+                localDate: true,
+                spendCents: true,
+                metaConversationsStarted: true,
+              },
+            }) as Promise<MetaAdSetDailyInsightRecord[]>)
+          : Promise.resolve([] as MetaAdSetDailyInsightRecord[]),
+        this.getReturningLeadEvents(input, { adSetIds }),
+      ]);
     const conversionLogsByAdSet = this.groupByOptionalKey(
       conversionLogs,
       "adSetId",
     );
     const leadsByAdSet = this.groupByOptionalKey(leads, "adSetId");
+    const returningEventsByAdSet = this.groupByOptionalKey(
+      returningEvents,
+      "adSetId",
+    );
     const dailyMetricByAdSet = this.completeDailyEntityMetrics({
       entityIds: adSetIds,
       entityId: (insight) => insight.adSetId,
@@ -2563,7 +2924,7 @@ export class MetaReportingService {
       since: input.since,
       until: input.until,
     });
-    const rows = paginated.items.map((adSet) =>
+    const paginated = this.paginateReportRows(filteredAdSets, input, (adSet) =>
       this.toAdSetReportRow({
         adSet,
         campaignName:
@@ -2572,9 +2933,11 @@ export class MetaReportingService {
         conversionLogs: conversionLogsByAdSet.get(adSet.adSetId) ?? [],
         funnelStages,
         leads: leadsByAdSet.get(adSet.adSetId) ?? [],
+        returningEvents: returningEventsByAdSet.get(adSet.adSetId) ?? [],
         metricOverride: dailyMetricByAdSet?.get(adSet.adSetId),
       }),
     );
+    const rows = paginated.items;
     const totalsMeta = filteredAdSets.reduce(
       (totals, adSet) => ({
         spendCents:
@@ -2594,6 +2957,7 @@ export class MetaReportingService {
       metaConversationsStarted: totalsMeta.metaConversationsStarted,
       events: conversionLogs,
       leads,
+      returningEvents,
       scope: {},
     });
 
@@ -2665,29 +3029,34 @@ export class MetaReportingService {
       adSetNames,
       deliveredIds,
     );
-    const paginated = this.paginateRecords(filteredAds, input);
     const adIds = filteredAds.map((ad) => ad.adId);
-    const [conversionLogs, leads, dailyInsights] = await Promise.all([
-      this.getMetricConversionEvents(input, { adIds }),
-      this.getLeads(input, { adIds }),
-      input.since && input.until && adIds.length
-        ? (this.prisma.metaAdDailyInsight.findMany({
-            where: {
-              workspaceId: input.workspaceId,
-              adId: { in: adIds },
-              localDate: { gte: input.since, lte: input.until },
-            },
-            select: {
-              adId: true,
-              localDate: true,
-              spendCents: true,
-              metaConversationsStarted: true,
-            },
-          }) as Promise<MetaAdDailyInsightRecord[]>)
-        : Promise.resolve([] as MetaAdDailyInsightRecord[]),
-    ]);
+    const [conversionLogs, leads, dailyInsights, returningEvents] =
+      await Promise.all([
+        this.getMetricConversionEvents(input, { adIds }),
+        this.getLeads(input, { adIds }),
+        input.since && input.until && adIds.length
+          ? (this.prisma.metaAdDailyInsight.findMany({
+              where: {
+                workspaceId: input.workspaceId,
+                adId: { in: adIds },
+                localDate: { gte: input.since, lte: input.until },
+              },
+              select: {
+                adId: true,
+                localDate: true,
+                spendCents: true,
+                metaConversationsStarted: true,
+              },
+            }) as Promise<MetaAdDailyInsightRecord[]>)
+          : Promise.resolve([] as MetaAdDailyInsightRecord[]),
+        this.getReturningLeadEvents(input, { adIds }),
+      ]);
     const conversionLogsByAd = this.groupByOptionalKey(conversionLogs, "adId");
     const leadsByAd = this.groupByOptionalKey(leads, "adId");
+    const returningEventsByAd = this.groupByOptionalKey(
+      returningEvents,
+      "adId",
+    );
     const dailyMetricByAd = this.completeDailyEntityMetrics({
       entityIds: adIds,
       entityId: (insight) => insight.adId,
@@ -2695,7 +3064,7 @@ export class MetaReportingService {
       since: input.since,
       until: input.until,
     });
-    const rows = paginated.items.map((ad) =>
+    const paginated = this.paginateReportRows(filteredAds, input, (ad) =>
       this.toAdReportRow({
         ad,
         campaignName:
@@ -2704,9 +3073,11 @@ export class MetaReportingService {
         conversionLogs: conversionLogsByAd.get(ad.adId) ?? [],
         funnelStages,
         leads: leadsByAd.get(ad.adId) ?? [],
+        returningEvents: returningEventsByAd.get(ad.adId) ?? [],
         metricOverride: dailyMetricByAd?.get(ad.adId),
       }),
     );
+    const rows = paginated.items;
     const totalsMeta = filteredAds.reduce(
       (totals, ad) => ({
         spendCents:
@@ -2725,6 +3096,7 @@ export class MetaReportingService {
       metaConversationsStarted: totalsMeta.metaConversationsStarted,
       events: conversionLogs,
       leads,
+      returningEvents,
       scope: {},
     });
 
@@ -2998,6 +3370,26 @@ export class MetaReportingService {
       items: records.slice(offset, offset + pageSize),
       pagination: { page, pageSize, totalItems, totalPages },
     };
+  }
+
+  private paginateReportRows<TRecord, TRow extends SortableReportRow>(
+    records: TRecord[],
+    input: Pick<ReportFilterInput, "page" | "pageSize" | "sort">,
+    toRow: (record: TRecord) => TRow,
+  ): PaginatedRecords<TRow> {
+    if (!input.sort) {
+      const paginated = this.paginateRecords(records, input);
+
+      return { ...paginated, items: paginated.items.map(toRow) };
+    }
+
+    // A metric sort needs every filtered row before slicing the page. The
+    // entities, events and leads behind those rows are already loaded for
+    // the totals, so this adds row construction but no queries.
+    return this.paginateRecords(
+      sortReportRows(records.map(toRow), input.sort),
+      input,
+    );
   }
 
   private groupByOptionalKey<
@@ -3329,6 +3721,7 @@ export class MetaReportingService {
     workspaceId: string;
     account: MetaReportingAccountRecord;
     ad: MetaAdAsset;
+    media: { previewUrl: string | null; thumbnailUrl: string | null };
     destinationType: string | null;
     insight?: MetaAdInsight;
     classification: WhatsappClassification;
@@ -3345,8 +3738,8 @@ export class MetaReportingService {
       effectiveStatus: input.ad.effectiveStatus,
       destinationType: input.destinationType,
       creativeId: input.ad.creativeId,
-      thumbnailUrl: input.ad.thumbnailUrl ?? null,
-      previewUrl: input.ad.previewUrl ?? null,
+      thumbnailUrl: input.media.thumbnailUrl,
+      previewUrl: input.media.previewUrl,
       callToActionType: input.ad.callToActionType,
       detectedPixelIds: input.ad.detectedPixelIds,
       detectedPageIds: input.ad.detectedPageIds,
@@ -3418,6 +3811,8 @@ export class MetaReportingService {
     leads: LeadRecord[],
     funnelStages: FunnelStageConfigurationDto[],
     metricOverride?: CampaignMetricOverride,
+    returningEvents: ConversionEventRecord[] = [],
+    leadIdsByPhoneHash?: ReadonlyMap<string, readonly string[]>,
   ): CampaignReportRowDto {
     const restrictToAdIds = metricOverride?.adIds.size
       ? metricOverride.adIds
@@ -3452,6 +3847,11 @@ export class MetaReportingService {
         campaign.metaConversationsStarted,
       events: campaignEvents,
       leads: campaignLeads,
+      returningEvents: returningEvents.filter(
+        (item) =>
+          item.campaignId === campaign.campaignId && belongsToMetricScope(item),
+      ),
+      leadIdsByPhoneHash,
       scope: { campaignId: campaign.campaignId },
     });
 
@@ -3476,6 +3876,7 @@ export class MetaReportingService {
     conversionLogs: ConversionEventRecord[];
     funnelStages: FunnelStageConfigurationDto[];
     leads: LeadRecord[];
+    returningEvents?: ConversionEventRecord[];
     metricOverride?: EntityMetricOverride;
   }): AdSetReportRowDto {
     const metrics = this.calculateMetrics({
@@ -3486,6 +3887,7 @@ export class MetaReportingService {
         input.adSet.metaConversationsStarted,
       events: input.conversionLogs,
       leads: input.leads,
+      returningEvents: input.returningEvents,
       scope: { adSetId: input.adSet.adSetId },
     });
 
@@ -3514,6 +3916,7 @@ export class MetaReportingService {
     conversionLogs: ConversionEventRecord[];
     funnelStages: FunnelStageConfigurationDto[];
     leads: LeadRecord[];
+    returningEvents?: ConversionEventRecord[];
     metricOverride?: EntityMetricOverride;
   }): AdReportRowDto {
     const metrics = this.calculateMetrics({
@@ -3524,6 +3927,7 @@ export class MetaReportingService {
         input.ad.metaConversationsStarted,
       events: input.conversionLogs,
       leads: input.leads,
+      returningEvents: input.returningEvents,
       scope: { adId: input.ad.adId },
     });
 
@@ -3589,6 +3993,8 @@ export class MetaReportingService {
     metaConversationsStarted: number;
     events: ConversionEventRecord[];
     leads: LeadRecord[];
+    returningEvents?: ConversionEventRecord[];
+    leadIdsByPhoneHash?: ReadonlyMap<string, readonly string[]>;
     scope: ReportingMetricScope;
   }): ReportRowMetrics {
     return this.metricsEngine.calculate({
@@ -3599,6 +4005,10 @@ export class MetaReportingService {
         metaConversationsStarted: input.metaConversationsStarted,
       },
       leads: input.leads,
+      returningEvents: input.returningEvents ?? [],
+      ...(input.leadIdsByPhoneHash
+        ? { leadIdsByPhoneHash: input.leadIdsByPhoneHash }
+        : {}),
       scope: input.scope,
     }) as ReportRowMetrics;
   }
@@ -3624,6 +4034,7 @@ export class MetaReportingService {
       },
       select: {
         id: true,
+        leadId: true,
         phoneHash: true,
         customerIdentityKey: true,
         businessSource: true,
@@ -3653,7 +4064,14 @@ export class MetaReportingService {
     })) as ConversionEventRecord[];
   }
 
-  private getLeads(
+  /**
+   * Leads novos of the period (first contact inside it), each carrying the
+   * attribution of that FIRST contact: a lead that later came back through
+   * another ad stays with the ad that brought it in (Lead rows keep the latest
+   * ad, so the first paid LeadSubmitted event decides). With a scope, a lead
+   * belongs to it when its first-contact attribution matches.
+   */
+  private async getLeads(
     input: {
       workspaceId: string;
       since?: string;
@@ -3662,14 +4080,32 @@ export class MetaReportingService {
     scope: ReportMetricScopeFilter = {},
   ): Promise<LeadRecord[]> {
     if (this.isEmptyMetricScope(scope)) {
-      return Promise.resolve([]);
+      return [];
     }
 
-    return this.prisma.lead.findMany({
+    const scopeWhere = this.metricScopeWhere(scope);
+    const scoped = Object.keys(scopeWhere).length > 0;
+    // A lead whose row now points at another ad still belongs to the scope
+    // when its first conversation in the period came from it.
+    const firstContactLeadIds = scoped
+      ? await this.leadIdsWithLeadSubmittedInScope(input, scope)
+      : [];
+    const periodWhere = this.leadPeriodWhere(input);
+    const leads = (await this.prisma.lead.findMany({
       where: {
         workspaceId: input.workspaceId,
-        ...this.metricScopeWhere(scope),
-        ...this.leadPeriodWhere(input),
+        ...(scoped
+          ? {
+              AND: [
+                periodWhere,
+                firstContactLeadIds.length
+                  ? {
+                      OR: [scopeWhere, { id: { in: firstContactLeadIds } }],
+                    }
+                  : scopeWhere,
+              ],
+            }
+          : periodWhere),
       },
       select: {
         id: true,
@@ -3681,7 +4117,165 @@ export class MetaReportingService {
         firstMessageAt: true,
         createdAt: true,
       },
-    }) as Promise<LeadRecord[]>;
+    })) as LeadRecord[];
+    // Same first-contact rule as the Leads page filters (shared helper).
+    const resolved = await withFirstContactAttribution(
+      this.prisma,
+      input.workspaceId,
+      leads,
+    );
+
+    return scoped
+      ? resolved.filter((lead) => this.matchesMetricScopeFilter(lead, scope))
+      : resolved;
+  }
+
+  private async leadIdsWithLeadSubmittedInScope(
+    input: { workspaceId: string; since?: string; until?: string },
+    scope: ReportMetricScopeFilter,
+  ): Promise<string[]> {
+    const events = (await this.prisma.conversionEventLog.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        ...paidLeadSubmittedEventWhere,
+        leadId: { not: null },
+        ...this.metricScopeWhere(scope),
+        ...this.eventPeriodWhere(input),
+      },
+      select: { leadId: true },
+    })) as Array<{ leadId: string | null }>;
+
+    return this.uniqueStrings(events.map((event) => event.leadId));
+  }
+
+  private matchesMetricScopeFilter(
+    item: {
+      campaignId: string | null;
+      adSetId: string | null;
+      adId: string | null;
+    },
+    scope: ReportMetricScopeFilter,
+  ): boolean {
+    if (scope.adIds) {
+      return Boolean(item.adId && scope.adIds.includes(item.adId));
+    }
+
+    if (scope.adSetIds) {
+      return Boolean(item.adSetId && scope.adSetIds.includes(item.adSetId));
+    }
+
+    if (scope.campaignIds) {
+      return Boolean(
+        item.campaignId && scope.campaignIds.includes(item.campaignId),
+      );
+    }
+
+    return true;
+  }
+
+  /**
+   * Leads que voltaram por anuncio: paid LeadSubmitted events in the period
+   * (attributed to the ad that brought them back) from people whose first
+   * contact was before the period. Needs a period start; events without a
+   * lead id are matched to the lead by phone hash.
+   */
+  private async getReturningLeadEvents(
+    input: {
+      workspaceId: string;
+      since?: string;
+      until?: string;
+    },
+    scope: ReportMetricScopeFilter = {},
+  ): Promise<ConversionEventRecord[]> {
+    if (!input.since || !input.until || this.isEmptyMetricScope(scope)) {
+      return [];
+    }
+
+    const events = (await this.prisma.conversionEventLog.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        ...paidLeadSubmittedEventWhere,
+        ...this.metricScopeWhere(scope),
+        ...this.eventPeriodWhere(input),
+      },
+      select: {
+        id: true,
+        leadId: true,
+        phoneHash: true,
+        customerIdentityKey: true,
+        businessSource: true,
+        campaignId: true,
+        adSetId: true,
+        adId: true,
+        ctwaClid: true,
+        eventName: true,
+        eventOccurredAt: true,
+        status: true,
+        valueCents: true,
+        valueSource: true,
+        currency: true,
+        purchaseKind: true,
+      },
+    })) as ConversionEventRecord[];
+
+    if (events.length === 0) {
+      return [];
+    }
+
+    const periodStart = this.eventPeriodWhere(input).eventOccurredAt?.gte;
+
+    if (!periodStart) {
+      return [];
+    }
+
+    const leadIds = this.uniqueStrings(
+      events.map((event) => event.leadId ?? null),
+    );
+    const phoneHashes = this.uniqueStrings(
+      events.map((event) => (event.leadId ? null : event.phoneHash)),
+    );
+    const returningLeads: Array<{ id: string; phoneHash: string }> = [];
+    const leadIdChunks = chunked(leadIds);
+    const phoneHashChunks = chunked(phoneHashes);
+
+    for (
+      let index = 0;
+      index < Math.max(leadIdChunks.length, phoneHashChunks.length);
+      index += 1
+    ) {
+      const ids = leadIdChunks[index] ?? [];
+      const hashes = phoneHashChunks[index] ?? [];
+      const rows = (await this.prisma.lead.findMany({
+        where: {
+          workspaceId: input.workspaceId,
+          AND: [
+            {
+              OR: [
+                ...(ids.length ? [{ id: { in: ids } }] : []),
+                ...(hashes.length ? [{ phoneHash: { in: hashes } }] : []),
+              ],
+            },
+            leadFirstContactBeforeWhere(periodStart),
+          ],
+        },
+        select: { id: true, phoneHash: true },
+      })) as Array<{ id: string; phoneHash: string }>;
+
+      returningLeads.push(...rows);
+    }
+
+    const returningIds = new Set(returningLeads.map((lead) => lead.id));
+    const leadIdByPhoneHash = new Map(
+      returningLeads.map((lead) => [lead.phoneHash, lead.id]),
+    );
+
+    return events.flatMap((event) => {
+      const leadId =
+        event.leadId ??
+        (event.phoneHash ? leadIdByPhoneHash.get(event.phoneHash) : undefined);
+
+      return leadId && returningIds.has(leadId) ? [{ ...event, leadId }] : [];
+    });
   }
 
   private metricScopeWhere(scope: ReportMetricScopeFilter) {
@@ -3924,8 +4518,8 @@ export class MetaReportingService {
 
   private dailyComparison(input: {
     dailyInsights: MetaCampaignDailyInsightRecord[];
-    events: ConversionEventRecord[];
     leads: LeadRecord[];
+    returningEvents: ConversionEventRecord[];
     since: string;
     until: string;
   }): ReportDailyComparisonPointDto[] {
@@ -3940,15 +4534,21 @@ export class MetaReportingService {
       );
     }
 
+    const dateKey = (date: Date) => dateInTimezone(date, timezone);
     const realByDate = this.metricsEngine.dailyRealConversationCounts(
-      { events: input.events, leads: input.leads },
-      (date) => dateInTimezone(date, timezone),
+      { leads: input.leads },
+      dateKey,
+    );
+    const returningByDate = this.metricsEngine.dailyReturningLeadCounts(
+      { returningEvents: input.returningEvents },
+      dateKey,
     );
 
     return this.reportDateRange(input.since, input.until).map((date) => ({
       date,
       metaConversationsStarted: metaByDate.get(date) ?? 0,
       realConversations: realByDate.get(date) ?? 0,
+      returningLeads: returningByDate.get(date) ?? 0,
     }));
   }
 
@@ -3984,18 +4584,9 @@ export class MetaReportingService {
       return {};
     }
 
-    const period = dateRangeInTimezone(
-      input.since,
-      input.until,
-      this.reportTimezone(),
+    return leadFirstContactInRangeWhere(
+      dateRangeInTimezone(input.since, input.until, this.reportTimezone()),
     );
-
-    return {
-      OR: [
-        { firstMessageAt: period },
-        { firstMessageAt: null, createdAt: period },
-      ],
-    };
   }
 
   private conversionAuditEventDto(
@@ -4046,8 +4637,7 @@ export class MetaReportingService {
       occurredAt: event.eventOccurredAt.toISOString(),
       sentAt: event.sentAt?.toISOString() ?? null,
       status: event.status,
-      canRetry:
-        event.status === "error" && event.errorCode === "MetaCapiNetworkError",
+      canRetry: canRetryConversionEvent(event),
       providerResponseSummary:
         event.status === "sent" && event.providerResponseSummary != null
           ? "Meta confirmou o recebimento"
@@ -4373,6 +4963,23 @@ export class MetaReportingService {
     return [
       ...new Set(values.filter((value): value is string => Boolean(value))),
     ];
+  }
+
+  private conversionAuditWhere(
+    input: ConversionAuditFilters,
+  ): Prisma.ConversionEventLogWhereInput {
+    return {
+      workspaceId: input.workspaceId,
+      ...this.conversionAuditPeriodWhere(input),
+      ...(input.eventName ? { eventName: input.eventName } : {}),
+      ...(input.deliveryState
+        ? { status: { in: this.conversionAuditStatuses(input.deliveryState) } }
+        : {}),
+      AND: [
+        this.conversionAuditSourceWhere(input.source),
+        { NOT: { sourceTrigger: "auto_lead", ctwaClid: null } },
+      ],
+    };
   }
 
   private conversionAuditSourceWhere(

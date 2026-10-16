@@ -15,6 +15,8 @@ const INBOUND_WHATSAPP_PROVIDERS = [
   "gupshup",
   "uazapi",
   "meta_cloud",
+  "data_crazy",
+  "unnichat",
 ] as const;
 
 export type MetaInitialSyncAnchorSource =

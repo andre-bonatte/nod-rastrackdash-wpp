@@ -222,7 +222,60 @@ describe("inbound webhook panel", () => {
     );
     expect(html).toContain("Webhooks de entrada");
     expect(html).toContain(
+      "Configure Umbler Talk, Gupshup, Data Crazy ou Meta WhatsApp (Cloud API).",
+    );
+    expect(html).not.toContain(
       "parser de mensagens sera disponibilizado posteriormente",
+    );
+  });
+
+  it("labels Data Crazy and explains where to paste the callback", () => {
+    expect(inboundWebhookProviderLabel("data_crazy")).toBe("Data Crazy");
+    expect(inboundPasteInstruction("data_crazy")).toBe(
+      "No Data Crazy, crie uma automacao de mensagem recebida com requisicao HTTP POST (JSON) e cole esta URL.",
+    );
+
+    const html = renderPanel({
+      connections: [],
+      capabilities: {
+        ...capabilities,
+        providers: [
+          ...capabilities.providers,
+          {
+            provider: "data_crazy",
+            parserVersion: "v1",
+            parserReleaseStatus: "observation_only",
+            creationEnabled: true,
+          },
+        ],
+      },
+    });
+
+    expect(html).toContain('<option value="data_crazy">Data Crazy</option>');
+  });
+
+  it("shows the Data Crazy one-time URL with its automation instruction", () => {
+    const html = renderOneTimeSecret({
+      provider: "data_crazy",
+      webhookUrl: "https://app.example.com/inbound/data_crazy/abc123",
+    });
+
+    expect(html).toContain("Cadastre este webhook no Data Crazy agora");
+    expect(html).toContain("Copiar URL");
+    expect(html).not.toContain("Verify token");
+    expect(html).toContain(inboundPasteInstruction("data_crazy"));
+  });
+
+  it("does not offer manual channel registration for Data Crazy and explains the automatic channel", () => {
+    const html = renderPanel({
+      connections: [connectionViewWithoutChannels({ provider: "data_crazy" })],
+    });
+
+    expect(html).toContain("Data Crazy - Observando");
+    expect(html).not.toContain("Cadastrar canal/numero");
+    expect(html).not.toContain("Nenhum canal cadastrado ainda");
+    expect(html).toContain(
+      "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar.",
     );
   });
 
@@ -320,13 +373,16 @@ describe("inbound webhook panel", () => {
     }
   });
 
-  it("keeps integrations focused on connection health and links to trigger settings", () => {
+  it("keeps integrations focused on connection health and links to the Conversões screen", () => {
     const html = renderPanel();
 
     expect(html).toContain("Gatilhos de conversao");
     expect(html).toContain("0 regra(s) nesta conexao");
-    expect(html).toContain('href="/settings#whatsapp-triggers"');
-    expect(html).toContain("Gerenciar gatilhos");
+    expect(html).toContain('href="/conversions"');
+    expect(html).toContain("Abrir Conversões");
+    expect(html).toContain("Crie e revise as regras na tela Conversões");
+    expect(html).not.toContain("whatsapp-triggers");
+    expect(html).not.toContain("Gerenciar gatilhos");
     expect(html).not.toContain("Qualificados e compras");
   });
 
@@ -376,7 +432,7 @@ describe("inbound webhook panel", () => {
     });
 
     expect(html).toContain("Prontidao parcial");
-    expect(html).toContain("<span>Rotas validas</span><strong>2/2</strong>");
+    expect(html).toContain("<span>Rotas válidas</span><strong>2/2</strong>");
     expect(html).toContain("<span>CTWA observados</span><strong>17</strong>");
     expect(html).toContain(
       "<span>Roteados preservados</span><strong>12</strong>",
@@ -426,9 +482,9 @@ describe("inbound webhook panel", () => {
     const analystHtml = renderPanel({ canManage: false });
 
     for (const command of [
-      "Adicionar conexao",
+      "Adicionar conexão",
       "Ativar envios automaticos",
-      "Pausar conexao",
+      "Pausar conexão",
       "Gerar nova URL",
       "Remover",
       "Pausar envio",
@@ -444,7 +500,7 @@ describe("inbound webhook panel", () => {
     expect(analystHtml).toContain("BM Vendas Atual");
     expect(analystHtml).toContain("Conta Suporte Atual");
     expect(analystHtml).toContain('aria-readonly="true"');
-    expect(analystHtml).not.toContain("Adicionar conexao");
+    expect(analystHtml).not.toContain("Adicionar conexão");
     expect(analystHtml).not.toContain("Gerar nova URL");
     expect(analystHtml).not.toContain("Pausar envio");
     expect(analystHtml).not.toContain("Adicionar rota");
@@ -505,9 +561,11 @@ function renderOneTimeSecret(
 function renderPanel({
   canManage = true,
   connections = [connectionView],
+  capabilities: panelCapabilities = capabilities,
 }: {
   canManage?: boolean;
   connections?: InboundWebhookConnectionView[];
+  capabilities?: InboundWebhookCapabilitiesDto;
 } = {}) {
   const action = vi.fn(async (_formData: FormData) => ({
     ok: true as const,
@@ -516,12 +574,13 @@ function renderPanel({
 
   return renderToStaticMarkup(
     createElement(InboundWebhookPanel, {
-      capabilities,
+      capabilities: panelCapabilities,
       connections,
       providerRules: [],
       providerRulesEnabled: true,
       metaConfiguration,
       canManage,
+      canRecover: canManage,
       createAction: action,
       rotateSecretAction: action,
       setConnectionStatusAction: action,
@@ -532,6 +591,17 @@ function renderPanel({
     }),
   );
 }
+
+it("offers student historical CTWA recovery on the Meta connection", () => {
+  const html = renderPanel({ connections: [{
+    ...connectionView,
+    overview: { ...connectionView.overview, connection: {
+      ...connectionView.overview.connection, provider: "meta_cloud", parserVersion: "v1",
+    } },
+  }] });
+  expect(html).toContain("Recuperar CTWAs anteriores");
+  expect(html).toContain("CTWA roteado nao significa enviado");
+});
 
 function inboundRoute({
   id,

@@ -16,7 +16,10 @@ type DiagnosticSource =
   | "external_mysql"
   | "internal"
   | "waha"
-  | "zapi";
+  | "zapi"
+  | "data_crazy"
+  | "payt"
+  | "unnichat";
 
 function diagnosticSourceForProvider(
   provider: InboundWebhookProviderDto,

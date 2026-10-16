@@ -40,6 +40,9 @@ export type InboundWebhookEventNormalizedSummary = {
   messageDirection: ParsedInboundWebhookMessageDirection;
   messageAuthorType: ParsedInboundWebhookMessageAuthorType;
   messageType: string | null;
+  phoneDivergenceDetected?: boolean;
+  /** sha256 of ctwa_clid (Unnichat click-scoped dedupe); never the raw id. */
+  ctwaEntryIdentityHash?: string;
   classification: InboundWebhookEventClassification;
   classificationReason: string;
 };
@@ -111,10 +114,32 @@ export type InboundWebhookParserResult = {
   error: InboundWebhookParserError | null;
 };
 
+export type InboundWebhookParserContext = {
+  organizationId?: string;
+  /**
+   * Channel phone bound by the connection (Unnichat), never a provider
+   * payload field.
+   */
+  connectedPhone?: string;
+};
+
+export function inboundWebhookParserContext(
+  workspaceId: string,
+  connectedPhone?: string | null,
+): Readonly<InboundWebhookParserContext> {
+  // connectedPhone: only the number bound to the connection (Unnichat).
+  return connectedPhone
+    ? { organizationId: workspaceId, connectedPhone }
+    : { organizationId: workspaceId };
+}
+
 export interface InboundWebhookParser {
   readonly provider: string;
   readonly parserVersion: string;
-  parse(payload: unknown): InboundWebhookParserResult;
+  parse(
+    payload: unknown,
+    context?: Readonly<InboundWebhookParserContext>,
+  ): InboundWebhookParserResult;
 }
 
 export type InboundWebhookEventDedupeIdentity = {

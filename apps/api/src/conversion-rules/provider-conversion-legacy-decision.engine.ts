@@ -27,7 +27,11 @@ export class ProviderConversionLegacyDecisionEngine {
     if (
       !input.rule.active ||
       input.occurrence.eventName !== input.rule.eventName ||
-      input.leadResolution.status !== "resolved"
+      input.leadResolution.status !== "resolved" ||
+      // As in the SaaS: the legacy/shadow engine keeps its ad-only
+      // authority. A CTWA lead without ad id (page/pixel proof) is decided
+      // only by the canonical engine.
+      !input.leadResolution.lead.adId
     ) {
       return null;
     }
@@ -117,6 +121,24 @@ export class ProviderConversionLegacyDecisionEngine {
         "automation_matched",
       );
     }
+    // A Payt sale carries its own value; the rule average is only a fallback.
+    if (
+      input.occurrence.provider === "payt" &&
+      input.occurrence.observedValueCents &&
+      input.occurrence.observedCurrency
+    ) {
+      return this.eligible(
+        input,
+        {
+          ...this.averageValueMatch(input, null),
+          parsedValueCents: input.occurrence.observedValueCents,
+          calculatedValueCents: input.occurrence.observedValueCents,
+          observedPaymentValueCents: input.occurrence.observedValueCents,
+          currency: input.occurrence.observedCurrency,
+        },
+        "automation_matched",
+      );
+    }
     if (!input.rule.defaultValueCents || !input.rule.defaultCurrency) {
       return null;
     }
@@ -199,17 +221,22 @@ export class ProviderConversionLegacyDecisionEngine {
       externalEventId: input.occurrence.externalEventId,
       externalMessageId: input.occurrence.externalMessageId,
       occurrenceKey: input.occurrence.occurrenceKey,
+      ...(input.occurrence.purchaseKey
+        ? { purchaseKey: input.occurrence.purchaseKey }
+        : {}),
       businessDedupePolicy:
-        input.rule.eventName === "QualifiedLead"
-          ? {
-              mode: "lifetime",
-              scopeKey,
-            }
-          : {
-              mode: "rolling_window",
-              scopeKey,
-              windowSeconds: PURCHASE_DEDUPE_WINDOW_SECONDS,
-            },
+        input.occurrence.provider === "payt" && input.occurrence.purchaseKey
+          ? { mode: "lifetime", scopeKey: input.occurrence.purchaseKey }
+          : input.rule.eventName === "QualifiedLead"
+            ? {
+                mode: "lifetime",
+                scopeKey,
+              }
+            : {
+                mode: "rolling_window",
+                scopeKey,
+                windowSeconds: PURCHASE_DEDUPE_WINDOW_SECONDS,
+              },
       eventName: input.occurrence.eventName,
       occurredAt: input.occurrence.occurredAt,
       authorType: input.occurrence.authorType,

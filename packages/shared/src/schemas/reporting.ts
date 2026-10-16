@@ -83,8 +83,25 @@ export const campaignReportRowSchema = z.object({
   spendCents: moneyCentsSchema,
   metaConversationsStarted: nonnegativeIntSchema,
   costPerMetaConversationCents: moneyCentsSchema.nullable(),
+  /**
+   * Leads novos (paid): people whose FIRST contact ever falls in the period,
+   * counted once, attributed to the ad of that first contact. CPL and the
+   * LeadSubmitted funnel stage use this number.
+   */
   realConversations: nonnegativeIntSchema,
   costPerRealConversationCents: moneyCentsSchema.nullable(),
+  /**
+   * People whose first contact was before the period and who started a new
+   * paid conversation in it ("voltaram por anuncio"). Never part of CPL.
+   */
+  returningLeads: nonnegativeIntSchema.optional(),
+  /** Paid LeadSubmitted events in the period (one per CTWA conversation sent to Meta). */
+  adConversationEvents: nonnegativeIntSchema.optional(),
+  /**
+   * People with two or more paid conversations (LeadSubmitted) in the period,
+   * leads novos included ("conversaram mais de uma vez"). Never part of CPL.
+   */
+  repeatConversationLeads: nonnegativeIntSchema.optional(),
   organicLeads: nonnegativeIntSchema,
   totalReceived: nonnegativeIntSchema,
   trackingRate: nonnegativeRateSchema.nullable(),
@@ -123,7 +140,10 @@ export const reportTotalsSchema = campaignReportRowSchema.omit({
 export const reportDailyComparisonPointSchema = z.object({
   date: reportDateSchema,
   metaConversationsStarted: nonnegativeIntSchema,
+  /** Leads novos whose first contact was on this day. */
   realConversations: nonnegativeIntSchema,
+  /** Leads antigos que voltaram por anuncio neste dia. */
+  returningLeads: nonnegativeIntSchema.optional(),
 });
 
 export const reportOverviewSchema = z.object({
@@ -317,6 +337,26 @@ export const conversionAuditOverviewSchema = z.object({
   events: z.array(conversionAuditEventSchema),
 });
 
+// Server-side report ordering is limited to existing canonical row metrics.
+// CPL is costPerRealConversationCents; CPM is not exposed by report rows.
+export const reportSortKeySchema = z.enum([
+  "realConversations",
+  "qualifiedLead",
+  "purchases",
+  "costPerRealConversationCents",
+  "costPerQualifiedLeadCents",
+  "costPerPurchaseCents",
+]);
+
+export const reportSortDirectionSchema = z.enum(["desc", "asc"]);
+
+export const reportSortSchema = z
+  .object({
+    key: reportSortKeySchema,
+    direction: reportSortDirectionSchema.default("desc"),
+  })
+  .strict();
+
 export const reportFiltersSchema = z.object({
   businessId: z.string().min(1).optional(),
   adAccountId: z.string().min(1).optional(),
@@ -389,3 +429,6 @@ export type MetaWhatsappOverrideInputDto = z.infer<
   typeof metaWhatsappOverrideInputSchema
 >;
 export type ReportFiltersDto = z.infer<typeof reportFiltersSchema>;
+export type ReportSortKeyDto = z.infer<typeof reportSortKeySchema>;
+export type ReportSortDirectionDto = z.infer<typeof reportSortDirectionSchema>;
+export type ReportSortDto = z.infer<typeof reportSortSchema>;

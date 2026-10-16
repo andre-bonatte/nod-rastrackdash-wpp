@@ -20,9 +20,12 @@ import { LeadsModule } from "./leads/leads.module";
 import { LicenseClientModule } from "./licensing-client/license-client.module";
 import { OnboardingModule } from "./onboarding/onboarding.module";
 import { ReportingModule } from "./reporting/reporting.module";
+import { TemplateVersionModule } from "./template-version/template-version.module";
 import { WebhooksModule } from "./webhooks/webhooks.module";
 import { WorkspacesModule } from "./workspaces/workspaces.module";
 import { OpsAlertsModule } from "./ops-alerts/ops-alerts.module";
+import { KommoModule } from "./kommo/kommo.module";
+import { PipedriveModule } from "./pipedrive/pipedrive.module";
 
 @Module({
   imports: [
@@ -46,6 +49,9 @@ import { OpsAlertsModule } from "./ops-alerts/ops-alerts.module";
     OpsAlertsModule,
     LicenseClientModule,
     OnboardingModule,
+    TemplateVersionModule,
+    KommoModule,
+    PipedriveModule,
   ],
   controllers: [HealthController],
   providers: [

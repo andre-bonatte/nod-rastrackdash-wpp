@@ -283,10 +283,19 @@ export class ProviderConversionDecisionEngine {
   ): StructuredCatalogTestMessageResultDto {
     // valueMode "message_extracted": the message carries the price, the
     // configured average value is only a fallback. Never invent a value.
-    const extractedValueCents = this.extractedValueCents(input);
+    // An automation callback (Payt) carries the sale value itself; the
+    // configured average value stays the fallback.
+    const extractedValueCents =
+      input.occurrence.source === "automation"
+        ? (input.occurrence.observedValueCents ?? null)
+        : this.extractedValueCents(input);
     const valueCents = extractedValueCents ?? input.rule.defaultValueCents;
     const currency =
-      input.rule.defaultCurrency ?? (extractedValueCents ? "BRL" : null);
+      (input.occurrence.source === "automation"
+        ? (input.occurrence.observedCurrency ?? null)
+        : null) ??
+      input.rule.defaultCurrency ??
+      (extractedValueCents ? "BRL" : null);
     const matched = Boolean(valueCents && currency);
 
     return {
@@ -382,6 +391,9 @@ export class ProviderConversionDecisionEngine {
       externalEventId: occurrence.externalEventId,
       externalMessageId: occurrence.externalMessageId,
       occurrenceKey: occurrence.occurrenceKey,
+      ...(occurrence.purchaseKey
+        ? { purchaseKey: occurrence.purchaseKey }
+        : {}),
       businessDedupePolicy,
       eventName: occurrence.eventName,
       occurredAt: occurrence.occurredAt,
@@ -399,6 +411,11 @@ export class ProviderConversionDecisionEngine {
       throw new Error("A business dedupe key requires a resolved paid lead");
     }
 
+    // A sale with a merchant order identity (Payt) is deduplicated forever by
+    // that identity (seller + order + event), never by the lead window.
+    if (input.occurrence.provider === "payt" && input.occurrence.purchaseKey) {
+      return { mode: "lifetime", scopeKey: input.occurrence.purchaseKey };
+    }
     const scopeKey = [
       input.rule.eventName,
       input.occurrence.workspaceId,

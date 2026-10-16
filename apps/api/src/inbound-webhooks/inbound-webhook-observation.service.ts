@@ -19,6 +19,7 @@ import {
   provisionalChannelOrganizationId,
   provisionalChannelProviderChannelId,
 } from "./inbound-webhook-provisional-channel";
+import { inboundWebhookParserContext } from "./providers/inbound-webhook-parser";
 import type {
   InboundWebhookDeliveryNormalizedSummary,
   InboundWebhookEventClassification,
@@ -252,7 +253,7 @@ export class InboundWebhookObservationService {
     let result: InboundWebhookParserResult;
 
     try {
-      result = this.parseEncryptedPayload(delivery, parser);
+      result = await this.parseEncryptedPayload(delivery, parser);
       this.validateParserResult(result, parser);
     } catch (error) {
       return this.finishFailure(
@@ -346,7 +347,7 @@ export class InboundWebhookObservationService {
         parserVersion: delivery.connection.parserRelease.version,
         parserReleaseStatus: delivery.connection.parserRelease.status,
       });
-      const result = this.parseEncryptedPayload(delivery, parser);
+      const result = await this.parseEncryptedPayload(delivery, parser);
       this.validateParserResult(result, parser);
       if (result.error || result.classification === "invalid_payload") {
         throw new InboundWebhookObservationError(
@@ -523,10 +524,10 @@ export class InboundWebhookObservationService {
     };
   }
 
-  private parseEncryptedPayload(
+  private async parseEncryptedPayload(
     delivery: LoadedDelivery,
     parser: InboundWebhookParser,
-  ): InboundWebhookParserResult {
+  ): Promise<InboundWebhookParserResult> {
     if (
       !delivery.encryptedPayload ||
       !delivery.payloadIv ||
@@ -581,13 +582,57 @@ export class InboundWebhookObservationService {
     }
 
     try {
-      return parser.parse(payload);
-    } catch {
+      const connectedPhone = await this.resolveBoundConnectedPhone(
+        delivery,
+        parser,
+      );
+
+      return parser.parse(
+        payload,
+        inboundWebhookParserContext(delivery.workspaceId, connectedPhone),
+      );
+    } catch (error) {
+      if (error instanceof InboundWebhookDeterministicFailure) {
+        throw error;
+      }
       throw new InboundWebhookDeterministicFailure(
         "inbound_webhook_parser_execution_failed",
         "invalid_payload",
       );
     }
+  }
+
+  /**
+   * Fase 4b: the Unnichat entry webhook carries no channel id. The number is
+   * bound when the connection is created (connectedPhone), so the parser
+   * receives it from the connection, never from the provider payload.
+   */
+  private async resolveBoundConnectedPhone(
+    delivery: LoadedDelivery,
+    parser: InboundWebhookParser,
+  ): Promise<string | null> {
+    if (parser.provider !== "unnichat") {
+      return null;
+    }
+
+    const channel = await this.prisma.inboundWebhookChannel.findFirst({
+      where: {
+        workspaceId: delivery.workspaceId,
+        connectionId: delivery.connectionId,
+        organizationId: delivery.workspaceId,
+      },
+      select: {
+        connectedPhone: true,
+      },
+    });
+    if (!channel?.connectedPhone?.trim()) {
+      throw new InboundWebhookDeterministicFailure(
+        "inbound_webhook_unnichat_channel_binding_missing",
+        "invalid_payload",
+      );
+    }
+
+    return channel.connectedPhone;
   }
 
   private deterministicProcessingFailure(error: unknown): DeterministicFailure {
@@ -878,12 +923,22 @@ export class InboundWebhookObservationService {
         channelName: event.channel.name,
         status: "discovered",
         conversionEngineMode: "canonical",
+        // Unnichat numbers explicitly follow the workspace Meta configuration
+        // (as in the SaaS); other providers keep the column default.
+        ...(delivery.provider === "unnichat"
+          ? { metaRoutingMode: "inherit_workspace" as const }
+          : {}),
         firstSeenAt: processedAt,
         lastSeenAt: processedAt,
       },
       update: {
         connectedPhone: event.channel.connectedPhone,
-        channelName: event.channel.name,
+        // The Unnichat entry webhook has no channel name: keep the name given
+        // when the connection was created.
+        channelName:
+          delivery.provider === "unnichat"
+            ? (event.channel.name ?? undefined)
+            : event.channel.name,
         lastSeenAt: processedAt,
       },
       select: { id: true },
@@ -984,7 +1039,7 @@ export class InboundWebhookObservationService {
         parserReleaseStatus: delivery.connection.parserRelease.status,
       });
       const result =
-        parsedResult ?? this.parseEncryptedPayload(delivery, parser);
+        parsedResult ?? (await this.parseEncryptedPayload(delivery, parser));
 
       this.validateParserResult(result, parser);
       if (result.error || result.classification === "invalid_payload") {
@@ -1211,6 +1266,13 @@ export class InboundWebhookObservationService {
       messageType: summary.messageType,
       classification: summary.classification,
       classificationReason: summary.classificationReason,
+      // Only the sha256 of ctwa_clid (already part of the Unnichat
+      // click-scoped dedupe key) is retained; the raw ctwa_clid never enters
+      // the summary.
+      ...(typeof summary.ctwaEntryIdentityHash === "string" &&
+      /^[0-9a-f]{64}$/u.test(summary.ctwaEntryIdentityHash)
+        ? { ctwaEntryIdentityHash: summary.ctwaEntryIdentityHash }
+        : {}),
     };
   }
 
